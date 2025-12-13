@@ -1,0 +1,14 @@
+# audio
+sounddevice>=0.4.6
+numpy>=1.23
+
+# whisper
+openai-whisper
+torch>=2.0
+tqdm
+
+# VAD (optional, fallback = energy VAD)
+webrtcvad-wheels; platform_system == "Windows"
+
+# LLM (REQUIRED)
+groq
