@@ -1,6 +1,7 @@
 # audio
 sounddevice>=0.4.6
 numpy>=1.23
+pycaw>=20240123
 
 # whisper
 openai-whisper
