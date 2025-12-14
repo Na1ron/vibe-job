@@ -33,15 +33,35 @@ def log(msg):
     print(msg, flush=True)
 
 
-def pick_input_device(user_value: str) -> int:
+def pick_input_device(user_value: str, use_loopback: bool):
     if user_value != "auto":
-        return int(user_value)
+        return int(user_value), None
+
+    if use_loopback:
+        wasapi_id = next(
+            (i for i, h in enumerate(sd.query_hostapis()) if "wasapi" in h["name"].lower()),
+            None,
+        )
+        if wasapi_id is None:
+            raise RuntimeError("WASAPI недоступен — loopback режим невозможен")
+
+        default_out = sd.default.device[1]
+        if default_out is not None:
+            info = sd.query_devices(default_out)
+            if info["hostapi"] == wasapi_id and info["max_output_channels"] > 0:
+                return default_out, sd.WasapiSettings(loopback=True)
+
+        for i, d in enumerate(sd.query_devices()):
+            if d["hostapi"] == wasapi_id and d["max_output_channels"] > 0:
+                return i, sd.WasapiSettings(loopback=True)
+
+        raise RuntimeError("Не найдено устройство вывода для loopback")
 
     for i, d in enumerate(sd.query_devices()):
         if d["max_input_channels"] > 0 and "cable output" in d["name"].lower():
-            return i
+            return i, None
 
-    return sd.default.device[0]
+    return sd.default.device[0], None
 
 
 def energy_is_speech(frame: np.ndarray, threshold: float = 0.01) -> bool:
@@ -59,6 +79,8 @@ def main():
     p.add_argument("--vad", default="webrtc", choices=["webrtc", "energy", "off"])
     p.add_argument("--frame-ms", type=int, default=30)
     p.add_argument("--silence-timeout", type=float, default=1.0)
+    p.add_argument("--loopback", action="store_true",
+                   help="Слушать системный микс через WASAPI loopback (игнорирует VB-Cable)")
 
     p.add_argument("--chat", action="store_true")
     p.add_argument("--groq-model", default="llama-3.1-8b-instant")
@@ -84,7 +106,7 @@ def main():
     frame_samples = int(SAMPLE_RATE * args.frame_ms / 1000)
     silence_limit = int(args.silence_timeout * 1000 / args.frame_ms)
 
-    input_dev = pick_input_device(args.input)
+    input_dev, extra_settings = pick_input_device(args.input, args.loopback)
     log(f"[AUDIO] Input device: {sd.query_devices(input_dev)['name']}")
 
     buffer = []
@@ -152,6 +174,7 @@ def main():
         blocksize=frame_samples,
         device=input_dev,
         callback=callback,
+        extra_settings=extra_settings,
     ):
         log("[AUDIO] Listening... Ctrl+C to stop")
         try:

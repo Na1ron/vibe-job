@@ -1,124 +1,62 @@
 import argparse
-import csv
 import subprocess
 import sys
 import time
-import zipfile
-import urllib.request
-import tempfile
-from pathlib import Path
 
-# ================== CONFIG ==================
+import comtypes.client
+from pycaw.constants import (
+    CLSID_MMDeviceEnumerator,
+    CLSID_PolicyConfigClient,
+    eCommunications,
+    eConsole,
+    eMultimedia,
+    eRender,
+)
+from pycaw.pycaw import AudioUtilities, IMMDeviceEnumerator, IPolicyConfigVista
 
-SVV_URL = "https://www.nirsoft.net/utils/soundvolumeview-x64.zip"
-SVV_DIR = Path(r"C:\tools\SoundVolumeView")
-SVV_EXE = SVV_DIR / "SoundVolumeView.exe"
 
-# ============================================
+ROLES = (eConsole, eMultimedia, eCommunications)
+
 
 def log(msg: str):
     print(f"[MASTER] {msg}", flush=True)
 
-# ---------- SoundVolumeView bootstrap ----------
 
-def ensure_soundvolumeview() -> Path:
-    if SVV_EXE.exists():
-        log("SoundVolumeView already installed")
-        return SVV_EXE
-
-    log("SoundVolumeView not found")
-    log("Downloading from nirsoft.net")
-
-    SVV_DIR.mkdir(parents=True, exist_ok=True)
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        zip_path = tmpdir / "soundvolumeview.zip"
-
-        urllib.request.urlretrieve(SVV_URL, zip_path)
-
-        log("Extracting SoundVolumeView...")
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(SVV_DIR)
-
-    if not SVV_EXE.exists():
-        raise RuntimeError("SoundVolumeView download failed")
-
-    log("SoundVolumeView installed successfully")
-    return SVV_EXE
-
-# ---------- SVV helpers ----------
-
-def run_svv(svv: Path, args: list[str], check=True):
-    subprocess.run(
-        [str(svv), *args],
-        check=check,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+def get_default_render_device_id():
+    enumerator = comtypes.client.CreateObject(
+        CLSID_MMDeviceEnumerator, interface=IMMDeviceEnumerator
     )
+    return enumerator.GetDefaultAudioEndpoint(eRender, eConsole).GetId()
 
-def dump_sessions_csv(svv: Path, csv_path: Path):
-    run_svv(svv, ["/scomma", str(csv_path)])
 
-def detect_encoding(path: Path) -> str:
-    raw = path.read_bytes()
-    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
-        return "utf-16"
-    if raw.startswith(b"\xef\xbb\xbf"):
-        return "utf-8-sig"
-    return "utf-8-sig"
-
-def read_render_app_rows(csv_path: Path):
-    enc = detect_encoding(csv_path)
-    log(f"CSV decoded as {enc}")
-
-    with csv_path.open("r", encoding=enc, newline="") as f:
-        reader = csv.DictReader(f)
-        log(f"CSV fields: {reader.fieldnames}")
-
-        return [
-            r for r in reader
-            if r.get("Type") == "Application"
-            and r.get("Direction") == "Render"
-        ]
-
-def get_active_render_sessions(svv: Path, csv_path: Path):
-    dump_sessions_csv(svv, csv_path)
-    rows = read_render_app_rows(csv_path)
-
-    sessions = {}
-    for r in rows:
-        exe = (r.get("Process Path") or "").strip()
-        if not exe:
+def find_render_device_id(target: str) -> tuple[str | None, str | None]:
+    target_lower = target.lower()
+    for device in AudioUtilities.GetAllDevices():
+        if device.DataFlow != eRender or device.State != 1:
             continue
+        if target_lower in device.FriendlyName.lower():
+            return device.id, device.FriendlyName
+    return None, None
 
-        sessions[exe.lower()] = {
-            "name": r.get("Name", "").strip(),
-            "exe": exe,
-            "device": r.get("Device Name", "").strip(),
-        }
 
-    return list(sessions.values())
-
-def set_app_default(svv: Path, exe_path: str, device_name: str):
-    run_svv(svv, ["/SetAppDefault", device_name, "all", exe_path])
-
-def kill_and_restart(exe_path: str, wait_s: float = 1.0):
-    exe_name = Path(exe_path).name
-    subprocess.run(
-        ["taskkill", "/IM", exe_name, "/F"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+def set_default_render(device_id: str):
+    policy = comtypes.client.CreateObject(
+        CLSID_PolicyConfigClient, interface=IPolicyConfigVista
     )
-    time.sleep(wait_s)
-    subprocess.Popen(exe_path, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for role in ROLES:
+        policy.SetDefaultEndpoint(device_id, role)
 
-# ---------- main ----------
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--target-render", default="CABLE Input")
-    p.add_argument("--no-restart", action="store_true")
+    p.add_argument(
+        "--target-render",
+        default=None,
+        help=(
+            "Имя (или часть имени) выходного устройства, которое нужно сделать "
+            "дефолтным перед запуском. Если не указано — сохраняется текущий дефолт."
+        ),
+    )
 
     # passthrough
     p.add_argument("--whisper-model", default="small")
@@ -135,58 +73,63 @@ def main():
 
     log(f"Python executable: {sys.executable}")
 
-    svv = ensure_soundvolumeview()
+    original_default = get_default_render_device_id()
+    target_friendly = None
 
-    csv_path = Path(tempfile.gettempdir()) / "svv_sessions.csv"
+    if args.target_render:
+        device_id, friendly = find_render_device_id(args.target_render)
+        if not device_id:
+            raise RuntimeError(
+                f'Не удалось найти рендер-устройство с именем, содержащим "{args.target_render}"'
+            )
 
-    log("Scanning render audio sessions...")
-    sessions = get_active_render_sessions(svv, csv_path)
-
-    if not sessions:
-        raise RuntimeError("No active render audio sessions found")
-
-    log(f"Found {len(sessions)} render sessions")
-    for s in sessions:
-        log(f" - {s['name']} | {Path(s['exe']).name} | device={s['device']}")
-
-    originals = sessions.copy()
-
-    log(f'Routing apps → "{args.target_render}"')
-    for s in sessions:
-        set_app_default(svv, s["exe"], args.target_render)
-        if not args.no_restart:
-            kill_and_restart(s["exe"])
-
-    log("Waiting 3s for audio to stabilize...")
-    time.sleep(3)
+        if device_id != original_default:
+            log(f'Переключаю дефолтный вывод на "{friendly}"...')
+            set_default_render(device_id)
+            target_friendly = friendly
+            time.sleep(1.0)
+        else:
+            log(f'Устройство "{friendly}" уже выбрано по умолчанию')
 
     cmd = [
         sys.executable,
         "stream_transcribe.py",
-        "--whisper-model", args.whisper_model,
-        "--device", args.device,
-        "--language", args.language,
-        "--input", args.input,
-        "--vad", args.vad,
-        "--silence-timeout", args.silence_timeout,
-        "--frame-ms", args.frame_ms,
+        "--whisper-model",
+        args.whisper_model,
+        "--device",
+        args.device,
+        "--language",
+        args.language,
+        "--input",
+        args.input,
+        "--vad",
+        args.vad,
+        "--silence-timeout",
+        args.silence_timeout,
+        "--frame-ms",
+        args.frame_ms,
+        "--loopback",
     ]
+
     if args.chat:
         cmd += ["--chat", "--groq-model", args.groq_model]
 
-    log("Starting streaming transcription...")
+    if target_friendly:
+        log(f"Запускаю стриминговую транскрибацию с loopback {target_friendly}...")
+    else:
+        log("Запускаю стриминговую транскрибацию с loopback дефолтного вывода...")
+
     try:
         subprocess.run(cmd, check=True)
     except KeyboardInterrupt:
         pass
-
-    log("Restoring original routing...")
-    for s in originals:
-        set_app_default(svv, s["exe"], s["device"])
-        if not args.no_restart:
-            kill_and_restart(s["exe"])
+    finally:
+        if args.target_render and original_default:
+            log("Возвращаю исходное дефолтное устройство вывода...")
+            set_default_render(original_default)
 
     log("Done")
+
 
 if __name__ == "__main__":
     main()
